@@ -51,10 +51,8 @@ Optional host-side services:
 
 - web search on `WEBSEARCH_ENDPOINT_URL`
 - document search on `DOC_SEARCH_ENDPOINT_URL`
-
-The worker currently exposes only the bounded web-search and document-search
-tools. Email, MCP, write, publish, and other action tools are not supported by
-this recipe.
+- outbound email on `MAILING_SERVICE_URL`
+- inbound email search on `EMAIL_ACTION_SERVICE_URL`
 
 ## Credentials And Secret Handling
 
@@ -65,11 +63,10 @@ Required values:
 - `OPENAI_API_KEY`
 - any non-default endpoint overrides your host requires
 
-The worker API **requires** authentication via `DEEPAGENTS_SERVICE_SECRET`. If
-you do not provide a value in `.env`, `scripts/bring-up.sh` automatically
-generates a strong secret and stores it in the gitignored `.run/worker-token`
-file. The script then installs the same token as a mode-`0600` credential file
-for the authorized sandbox client.
+Recommended values:
+
+- `DEEPAGENTS_SERVICE_SECRET` so the worker API is not left unauthenticated on
+  a shared host
 
 Do not commit `.env`, generated state, or sandbox-local token material. The
 local `.gitignore` excludes `.env`, `state/`, and `.run/`.
@@ -112,6 +109,7 @@ flowchart LR
     llm["OpenAI-compatible inference endpoint"]
     web["Optional web-search service"]
     docs["Optional doc-search service"]
+    mail["Optional email services"]
 
     sandbox --> cli
     cli --> client
@@ -120,6 +118,7 @@ flowchart LR
     engine --> llm
     engine -. tool calls .-> web
     engine -. tool calls .-> docs
+    engine -. tool calls .-> mail
     worker -->|"GET /v1/tasks/{id}"| client
 ```
 
@@ -134,14 +133,14 @@ sequenceDiagram
     participant Queue as SQLite Queue
     participant Engine as DeepAgents Engine
     participant LLM as LLM Provider
-
+    
     User ->> CLI: /sandbox/bin/deep-research<br/>"Research topic"
     CLI ->> Client: parse args & init
-    Client ->> API: POST /v1/tasks<br/>{query, depth, rubric}
+    Client ->> API: POST /v1/tasks<br/>{prompt, depth, rubric}
     API ->> Queue: enqueue task
     API -->> Client: {task_id, status: queued}
     Client -->> User: Task ID returned<br/>(--task-id-only)
-
+    
     activate Engine
     API ->> Engine: [Worker thread picks up]
     Engine ->> Engine: Phase 1: Planning<br/>Phase 2: Research
@@ -150,7 +149,7 @@ sequenceDiagram
     Engine ->> Engine: Phase 3: Cross-validation<br/>Phase 4: Finalization
     Engine ->> Queue: update task result
     deactivate Engine
-
+    
     User ->> Client: /sandbox/bin/deep-research<br/>--resume task_id
     Client ->> API: GET /v1/tasks/{task_id}
     API ->> Queue: fetch task
@@ -190,24 +189,24 @@ sequenceDiagram
 | `scripts/teardown.sh` | Stops the worker and removes the installed skill assets |
 | `src/` | Worker service, task store, client, and container build files |
 
-## Execution Depth Presets
+## DeepAgents Design And Execution Model
 
-The research worker supports three depth levels that control the LangGraph
-recursion limit, tool-call budget, minimum plan steps, and rubric iteration
-count.
+The research worker runs a **LangGraph-based agentic loop** that implements multi-step research with quality-driven refinement.
 
-| Depth | Graph Steps (recursion_limit) | Tool Call Budget | Rubric Iterations | Min Plan Steps | Use Case |
-| --- | --- | --- | --- | --- | --- |
-| `shallow` | 25 | 25 | 1 | 3 | Quick fact-checking, single-topic summaries |
-| `standard` | 50 | 60 | 2 | 5 | Competitive analysis, multi-source research (default) |
-| `deep` | 100 | 120 | 3 | 7 | Comprehensive reviews, cross-domain synthesis |
+### Execution Depth Presets
+
+| Depth | Graph Steps | Rubric Iterations | Max Duration | Use Case |
+| --- | --- | --- | --- | --- |
+| `shallow` | 25 | 1 | 5 min | Quick summaries, fact-checking single topics |
+| `standard` | 50 | 2 | 15 min | Competitive analysis, multi-source research (default) |
+| `deep` | 100 | 3 | 40 min | Whitepapers, comprehensive reviews, cross-domain synthesis |
 
 ```mermaid
 graph LR
-    A["Shallow<br/>--depth shallow"] -->|"25 graph steps<br/>25 tool calls<br/>1 rubric iteration"| B["Quick Summary"]
-    C["Standard<br/>--depth standard<br/>(default)"] -->|"50 graph steps<br/>60 tool calls<br/>2 rubric iterations"| D["Balanced Analysis"]
-    E["Deep<br/>--depth deep"] -->|"100 graph steps<br/>120 tool calls<br/>3 rubric iterations"| F["Exhaustive Research"]
-
+    A["Shallow<br/>--depth shallow"] -->|"25 steps<br/>1 iteration"| B["Quick Summary<br/>5 min"]
+    C["Standard<br/>--depth standard<br/>default"] -->|"50 steps<br/>2 iterations"| D["Balanced Analysis<br/>15 min"]
+    E["Deep<br/>--depth deep"] -->|"100 steps<br/>3 iterations"| F["Exhaustive Research<br/>40 min"]
+    
     style A fill:#fff0f0
     style B fill:#ffe0e0
     style C fill:#f0f0ff
@@ -216,29 +215,72 @@ graph LR
     style F fill:#e0ffe0
 ```
 
-These are **effort budgets**, not completion guarantees. Actual execution time
-depends on tool latency, LLM inference time, and network availability. The
-client polling loop will stop waiting for results when the configured
-`timeout_ms` is exceeded.
+### Agentic Loop Phases
+
+```mermaid
+sequenceDiagram
+    actor User
+    User ->> CLI: /sandbox/bin/deep-research<br/>--depth deep --rubric "..."<br/>"Research prompt"
+    CLI ->> Client: Submit task
+    Client ->> API: POST /v1/tasks
+    API ->> Engine: Task queued
+    
+    loop Per Depth Level (1-3 iterations)
+        Engine ->> Engine: 1. PLANNING<br/>Detect domain<br/>Synthesize rubric<br/>Generate TODOs
+        Engine ->> Engine: 2. RESEARCH<br/>Execute web_search<br/>Execute doc_search<br/>SubAgent delegation
+        Engine ->> Engine: 3. CROSS-VALIDATION<br/>RubricMiddleware<br/>Check completeness<br/>Identify gaps
+        Engine ->> Engine: 4. REFINEMENT<br/>Fill gaps<br/>Strengthen citations<br/>Iterate if needed
+    end
+    
+    Engine ->> Engine: 5. FINALIZATION<br/>Format report<br/>Cite sources<br/>Generate metadata
+    API ->> SQLite: Store result
+    Client ->> User: Print results
+```
+
+**Phase Details:**
+
+1. **Planning**: Agent synthesizes domain-adaptive TODOs and quality rubric
+   - Automatically detects domain (legal, finance, tech, etc.) from the research goal
+   - Generates discipline-specific quality criteria (e.g., "include statutory citations" for legal, "asset allocation tables" for finance)
+   - Defines evaluation checkpoints based on depth level
+
+2. **Research and Refinement**: Agent iterates through research steps
+   - Executes web search, document lookup, and other tool calls
+   - Delegates subtopics to isolated `SubAgent` workers to prevent context window saturation
+   - Synthesizes partial findings and identifies knowledge gaps
+
+3. **Cross-Validation (RubricMiddleware)**: Quality gates enforce completeness
+   - Evaluates output against the synthesized or custom rubric
+   - Identifies missing sections, weak citations, or incomplete analyses
+   - Triggers refinement loops if quality criteria are not met (up to N iterations per depth level)
+
+4. **Finalization**: Formats and delivers the completed research report
+   - Structures output with sections, summaries, source citations
+   - Returns task completion with full text and metadata
 
 ### Custom Rubrics
 
-Users can provide a custom rubric with `--rubric "<criteria>"`:
+Users can override the auto-synthesized rubric with `--rubric "<criteria>"`:
 
 ```bash
 /sandbox/bin/deep-research --depth deep --rubric \
-  "Must include: (1) current vendor landscape, (2) technical requirements, (3) cost analysis" \
-  "Evaluate enterprise vector database options for 2026"
+  "Must include: (1) asset allocation tables, (2) tax drag calculations, (3) SEC compliance notes" \
+  "Analyze portfolio rebalancing strategy for high-net-worth tech employee"
 ```
 
-The custom rubric becomes an evaluation constraint. The agent iterates up to a
-bounded number of times per depth level (1 iteration for shallow, 2 for standard,
-3 for deep) to evaluate output against the rubric. Iteration limits are based on
-depth; the agent does not guarantee that all criteria will be satisfied if the
-step budget is exhausted.
+The rubric becomes a hard constraint; the agent will iterate until all criteria are satisfied or the graph step budget is exhausted.
 
-If you do not provide a custom rubric, the worker generates a request-specific
-but generic rubric that guides the agent toward comprehensive research coverage.
+### Tool Integration And Safety
+
+The worker can call bounded helper services:
+- **Web search**: Returns top results with relevance scoring
+- **Document search**: Searches indexed internal documents (e.g., prior research, legal templates)
+- **Email tools**: Send task results or fetch email summaries (when configured)
+
+A **circuit breaker** prevents cascading failures:
+- Transient errors (429, 5xx, timeouts) trigger exponential backoff and retry
+- Tool failures do not block the graph; the agent pivots to alternative research strategies
+- Permanent errors (400, 403) fail fast
 
 ## Usage Examples
 
@@ -250,7 +292,7 @@ openshell sandbox exec --name deep-research-worker -- \
   "Summarize the latest NIST cybersecurity framework updates"
 ```
 
-Uses the shallow budget (25 graph steps, 25 tool calls, 1 rubric iteration).
+Expected time: ~5 minutes. Returns a concise summary with key points and sources.
 
 ### Example 2: Competitive Analysis (Standard Depth)
 
@@ -260,23 +302,30 @@ openshell sandbox exec --name deep-research-worker -- \
   "Compare vector database performance: Pinecone vs. Weaviate vs. Milvus in 2026"
 ```
 
-Uses the standard budget (50 graph steps, 60 tool calls, 2 rubric iterations).
-This is the default when `--depth` is not specified.
+Expected time: ~15 minutes. Returns structured comparison with benchmarks, feature matrices, and cost analysis.
 
-### Example 3: Deep Research with Custom Rubric
+### Example 3: Deep Exhaustive Research with Custom Rubric
 
 ```bash
 openshell sandbox exec --name deep-research-worker -- \
   /sandbox/bin/deep-research --depth deep \
   --rubric "Must cover: (1) regulatory landscape, (2) technical implementation patterns, (3) case studies, (4) risk assessment" \
-  "Research agentic workflow platform security and draft a technical whitepaper"
+  "Research 5 levels of agentic workflow platform security and draft a technical whitepaper"
 ```
 
-Uses the deep budget (100 graph steps, 120 tool calls, 3 rubric iterations).
-The custom rubric drives evaluation for up to 3 iterations; the agent does not
-guarantee that every rubric criterion will be satisfied within the step budget.
+Expected time: ~40 minutes. The agent will iterate until all rubric criteria are satisfied.
 
-### Example 4: Asynchronous Task Submission and Polling
+### Example 4: Portfolio Rebalancing Analysis (Domain-Adaptive Rubric)
+
+```bash
+openshell sandbox exec --name deep-research-worker -- \
+  /sandbox/bin/deep-research --depth deep \
+  "Analyze portfolio rebalancing strategy for high-net-worth tech employee with concentrated stock positions"
+```
+
+Output includes asset allocation tables, tax drag calculations, and regulatory considerations (auto-generated).
+
+### Example 5: Asynchronous Task Submission and Polling
 
 ```bash
 openshell sandbox exec --name deep-research-worker -- \
@@ -300,7 +349,7 @@ openshell sandbox exec --name deep-research-worker -- \
   /sandbox/bin/deep-research --list 5
 ```
 
-### Example 5: Export Results to JSON
+### Example 6: Export Results to JSON
 
 ```bash
 openshell sandbox exec --name deep-research-worker -- \
@@ -308,9 +357,7 @@ openshell sandbox exec --name deep-research-worker -- \
   "Compare open-source model serving frameworks"
 ```
 
-The `--json` flag prints the raw task record returned by the worker API. The
-`--output` flag writes the same record to the given file. See the
-[Response Format](#response-format) section for the exact fields returned.
+The JSON output includes task_id, status, full research text, metadata (depth, execution time, step count), and sources with confidence scores.
 
 ## Task Lifecycle And State Management
 
@@ -322,54 +369,64 @@ A research task progresses through the following states:
 | --- | --- |
 | `queued` | Task received, waiting for a worker thread |
 | `running` | DeepAgents graph is executing research steps |
+| `cancelling` | DELETE received; process group is being stopped |
+| `cancelled` | Task stopped by caller request |
 | `completed` | Research finished successfully; results are ready |
-| `failed` | Task failed after all retries; error message available |
-| `cancelled` | Task was cancelled before completion |
-
-Terminal tasks (completed, failed, cancelled) are automatically deleted after 7
-days (TTL) via the `cleanup_expired` background job. Deleted tasks cannot be
-retrieved.
-
-### Task Retry Behavior
-
-The worker uses **task-level retries** distinct from **tool-call retries**:
-
-#### Task Retries
-
-- **Scope**: The entire task execution restarts if it fails
-- **Trigger**: Permanent errors (400, 403, auth failure) or step budget exhaustion
-  without completion
-- **Configuration**: `DEEPAGENTS_TASK_MAX_RETRIES` (default: 2 retries)
-- **Behavior**: On failure, the worker marks the task as failed and moves to the
-  next queued task; abandoned running tasks are not replayed automatically on
-  service restart
-
-#### Tool-Call Retries
-
-- **Scope**: Individual tool invocations (`web_search`, `doc_search`) within a
-  running task
-- **Trigger**: Transient errors (HTTP 429, 500, 502, 503, 504 and timeouts)
-- **Behavior**: Up to 2 in-line retries per tool call with exponential backoff
-  (delays 1s, 2s starting from `base_delay=1.0`)
-- **Configuration**: Per-tool timeout settings
-  (`DEEPAGENTS_TOOL_TIMEOUT_WEB_SEARCH` default 15s,
-  `DEEPAGENTS_TOOL_TIMEOUT_DOC_SEARCH` default 20s)
-- **Circuit breaker**: A per-tool circuit opens after 5 failures within 60
-  seconds and stays open for 60 seconds before transitioning to half-open;
-  while open, calls short-circuit with `[circuit_open]` so the agent can pivot
-  to alternative tools.
-- **Failure**: If all retries exhaust, the tool call returns a structured
-  error (`[transient_error]`, `[permanent_error]`, or `[circuit_open]`); the
-  agent loop continues and may pivot to alternative research strategies.
+| `failed` | Task failed; error message available |
+| `expired` | Task results deleted after 7-day TTL |
 
 ### Task State Transitions
 
+```mermaid
+stateDiagram-v2
+    [*] --> queued: POST /v1/tasks
+    queued --> running: worker process acquired
+    queued --> cancelled: DELETE while queued
+    running --> cancelling: DELETE while running
+    cancelling --> cancelled: process group stopped
+    running --> completed: research finished successfully
+    running --> failed: permanent error or retries exhausted
+    running --> queued: transient timeout retry
+    failed --> [*]
+    cancelled --> [*]
+    completed --> expired: 7 days elapsed
+    expired --> [*]
 ```
-queued --> running --> completed
-           --> failed (after max retries or permanent error)
-           --> cancelled (user request)
 
-completed/failed/cancelled --> [deleted after 7 days by cleanup_expired]
+### Retry Behavior
+
+Task-level retries occur only when the worker process exceeds its execution
+timeout (`timeout_ms`). All other failure modes are permanent and go directly
+to `failed`:
+
+- **Task timeout** (`timeout_ms` exceeded): Re-queued with exponential backoff
+  (`2^retry_count` seconds, capped at 60 s). Default max retries: **2**
+  (configurable per task via `max_retries`).
+- **Permanent errors** (import failures, graph recursion limit, auth errors,
+  unhandled exceptions): Fail immediately; no retry.
+- **Budget exhaustion** (tool-call budget reached mid-task): Permanent failure;
+  no retry.
+- **Cancelled tasks**: Never retried.
+
+Tool-call retries (inside a single task execution) are a separate concern:
+transient HTTP errors (429, 5xx, network timeout) are retried up to 2 times
+with exponential backoff before the tool returns a structured error token to
+the agent. Tool-call retries do not affect task-level retry counts.
+
+```mermaid
+graph TD
+    A["Task subprocess exits"] --> B{Exit reason?}
+    B -->|"Completed
+result written"| C["Task: completed"]
+    B -->|"Cancelled"| D["Task: cancelled"]
+    B -->|"Timeout
+(timeout_ms exceeded)"| E{"retry_count
+< max_retries?"}
+    B -->|"Permanent error
+or budget exhausted"| F["Task: failed"]
+    E -->|Yes| G["Re-queue with backoff
+retry_count += 1"]
+    E -->|No| F
 ```
 
 ## Setup And Configuration
@@ -414,28 +471,31 @@ graph TB
         CLI["deep-research CLI"]
         Client["DeepResearchClient"]
     end
-
+    
     subgraph Host ["Host (Trusted)"]
         API["Worker API<br/>host.openshell.internal:9050"]
         Engine["DeepAgents Engine"]
-        Web["Web Search Service<br/>WEBSEARCH_ENDPOINT_URL"]
-        Docs["Doc Search Service<br/>DOC_SEARCH_ENDPOINT_URL"]
+        Web["Web Search Service<br/>:8001"]
+        Docs["Doc Search Service<br/>:8002"]
+        Mail["Email Service<br/>:8003"]
     end
-
+    
     subgraph External ["External LLM"]
         LLM["OpenAI-compatible<br/>Inference Endpoint"]
     end
-
+    
     CLI -->|"POST /v1/tasks<br/>GET /v1/tasks/{id}<br/>POLICY ENFORCED"| API
     Client -->|"Same Routes"| API
-
-    Sandbox -.->|"No Direct Access"| Web
-    Sandbox -.->|"No Direct Access"| Docs
-
+    
+    API -->|"No Direct Access"| Web
+    API -->|"No Direct Access"| Docs
+    API -->|"No Direct Access"| Mail
+    
     Engine -->|"tool_call"| Web
     Engine -->|"tool_call"| Docs
+    Engine -->|"tool_call"| Mail
     Engine -->|"API Call"| LLM
-
+    
     style Sandbox fill:#ffcccc
     style Host fill:#ccffcc
     style External fill:#ccccff
@@ -485,52 +545,65 @@ PASS: deep-research-worker local verification
 
 ## Output Formats And Result Handling
 
-### Response Format
+### Default Output Format (Plain Text)
 
-The worker returns task data with these fields:
+By default, the client prints the task `result` field from the server response
+directly to stdout. The format of that text is determined by the agent's
+output; no wrapper or header is added by the client:
+
+```
+## Executive Summary
+[Agent-generated summary paragraph]
+
+## Key Findings
+- Finding 1
+- Finding 2
+
+## Detailed Analysis
+[Full technical analysis]
+
+## Sources
+- https://example.com/doc1
+- https://example.com/doc2
+```
+
+### JSON Output Format
+
+Use `--json` to write a structured envelope to stdout (or `--output <path>` to
+write to a file instead). The client emits exactly these six fields:
+
+```bash
+openshell sandbox exec --name deep-research-worker -- \
+  /sandbox/bin/deep-research --json --output /tmp/result.json \
+  "Research AI safety frameworks"
+```
 
 ```json
 {
-  "task_id": "f7e2a1b3-c9d4-e5f6...",
+  "task_id": "f7e2a1b3c9d4e5f6",
   "status": "completed",
-  "prompt": "Research topic...",
   "depth": "standard",
-  "rubric": "custom rubric or default",
-  "result": "full research text output",
-  "duration_seconds": 754.23,
-  "retry_count": 0,
-  "max_retries": 2,
-  "created_at": "2026-08-14T12:00:00Z",
-  "completed_at": "2026-08-14T12:13:00Z",
-  "tool_calls": [{"tool": "web_search", "query": "...", "timestamp": "..."}],
-  "tool_call_count": {"web_search": 5, "doc_search": 3}
+  "result": "<agent-generated markdown>",
+  "duration_seconds": 743,
+  "retry_count": 0
 }
 ```
 
-### Plain Text Output
-
-By default, results are printed to stdout:
-
-```
-=== Deep Research Report ===
-
-Query: Compare vector database performance in 2026
-Depth: standard
-Result:
-[Full research text from the worker]
-
-Duration: 12m 34s
-Tool Calls: web_search (5), doc_search (3)
-```
+No additional metadata fields (graph steps, rubric iterations, sources, or
+timestamps) are included in the client output. Those fields are available on
+the raw task object returned by `GET /v1/tasks/{task_id}` if you need them.
 
 ### Handling Large Results
 
 For very long research outputs:
 
-1. **Save to file**: Capture stdout to a file instead of printing to console
-2. **Check result field**: Parse `result` from the JSON response programmatically
-3. **Use tool_call_count**: Inspect how many tool calls were made to gauge result
-   quality
+1. **Write to a file with `--output`**: Redirects stdout to a file instead of
+   the terminal.
+2. **Use `--json` for programmatic parsing**: Wraps the result in the six-field
+   envelope above so downstream tools can parse `result` as a string.
+3. **Fetch raw task data**: Call `GET /v1/tasks/{task_id}` directly from a
+   host-side script to access the full stored task record, which includes
+   timestamps and other internal fields.
 
 ## Known Limitations
 
@@ -539,19 +612,16 @@ For very long research outputs:
 - The worker depends on third-party packages and live host-side services. The
   DeepAgents version is pinned for the tested rubric API, but the example does
   not include a complete transitive lockfile.
-- The default client and worker timeouts are tuned for long-running research,
-  not low-latency chat turns.
+- There are two distinct timeout settings. `--timeout <seconds>` (or the
+  depth-based default: shallow=300 s, standard=900 s, deep=2400 s) controls
+  how long the **client** polls before printing a resume hint and exiting.
+  `timeout_ms` in the API body (default 600 000 ms, env
+  `DEEPAGENTS_TASK_TIMEOUT_MS`) controls how long the **server-side task
+  process** runs before it is killed and the task is retried or failed. A
+  client polling timeout does not stop the server task.
 - Operators who use `openshell policy set` without a dedicated sandbox can
   replace unrelated policy rules; the script blocks that path unless
   `DEEP_RESEARCH_ALLOW_POLICY_REPLACE=1` is set explicitly.
-- Domain detection and discipline-specific rubric generation are not implemented.
-  The default rubric is generic and request-specific; custom rubrics must be
-  provided by the user for domain-specific evaluation.
-- JSON output does not include structured sections, source citations with
-  confidence scores, graph-step execution counts, or rubric iteration metadata.
-  It contains task metadata and the full result text only.
-- Task retries restart the entire task execution; abandoned running tasks are
-  not replayed on service restart.
 
 ## Third-Party Dependencies And License Notes
 
