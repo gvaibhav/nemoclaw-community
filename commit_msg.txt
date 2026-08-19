@@ -1,0 +1,18 @@
+feat(axe-a11y): add axe-a11y-browser-auditor community recipe
+
+Add a new community recipe that implements the 3-layer accessibility audit
+architecture proposed in issue #109.
+
+The recipe installs an axe-a11y skill into an OpenClaw sandbox and routes
+MCP tool calls to a host-side Docker sidecar running axe-core and Patchright
+against real Google Chrome Stable inside an Xvfb virtual framebuffer. VNC
+observation and a persistent-profile mechanism handle sites behind bot
+detection or authentication walls.
+
+9 MCP tools: audit_page, check_specific_rules, audit_element, get_wcag_summary,
+axe_capture_page, axe_capture_element, record_page_session, generate_pdf,
+capture_network.
+
+Closes #109
+
+Signed-off-by: Jules <jules@example.com>
